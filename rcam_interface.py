@@ -589,21 +589,26 @@ class RCAMApp(tk.Tk):
             c = self._t3_console
             self._console_clear(c)
             self._console_write(c, "═"*55, "heading")
-            self._console_write(c, "  TAREA 3 — PULSO ALERÓN +5° (t=30–32 s)", "heading")
+            self._console_write(c, "  TAREA 3 — PULSO ALERÓN +5° (t=5–7 s)", "heading")
             self._console_write(c, "═"*55, "heading")
+            self._console_write(c,
+                "  Pulso en t=5–7 s → Va≈84 m/s (condición inicial)", "dim")
+            self._console_write(c,
+                "  (Antes estaba en t=30–32 s: Va=123 m/s, θ=−13°, incorrecto)", "warn")
 
-            # Necesitamos la base para comparar
-            if "t2" not in self._data:
-                self._console_write(c, "  Calculando base primero…", "dim")
-                t2, X2, pos2 = simulate(X0, constant_control, (0, 180), dt=1.0)
-                self._data["t2"] = {"t": t2, "X": X2, "pos": pos2}
+            # dt=0.1 s para AMBAS simulaciones → misma longitud de vector → sin error de shape.
+            # Se guarda como "t2_fine" para no sobreescribir el caché de Tarea 2 (dt=1.0).
+            if "t2_fine" not in self._data:
+                self._console_write(c, "  Calculando base (alta resolución)…", "dim")
+                t2, X2, pos2 = simulate(X0, constant_control, (0, 180), dt=0.1)
+                self._data["t2_fine"] = {"t": t2, "X": X2, "pos": pos2}
             else:
-                t2   = self._data["t2"]["t"]
-                X2   = self._data["t2"]["X"]
-                pos2 = self._data["t2"]["pos"]
+                t2   = self._data["t2_fine"]["t"]
+                X2   = self._data["t2_fine"]["X"]
+                pos2 = self._data["t2_fine"]["pos"]
 
             self._console_write(c, "  Simulando con pulso de alerón…", "dim")
-            t3, X3, pos3 = simulate(X0, aileron_impulse_control, (0, 180), dt=1.0)
+            t3, X3, pos3 = simulate(X0, aileron_impulse_control, (0, 180), dt=0.1)
             self._data["t3"] = {"t": t3, "X": X3, "pos": pos3}
 
             self.after(0, lambda: self._render_task3(t3, X3, X2, pos3, pos2))
@@ -616,24 +621,26 @@ class RCAMApp(tk.Tk):
 
             p_min  = np.degrees(X3[:, 3].min())
             t_pmin = t3[np.argmin(X3[:, 3])]
-            phi_35 = np.degrees(X3[min(35, len(X3)-1), 6])
-            r_adv  = np.degrees(X3[30:32, 5].mean())
+            idx_12 = np.searchsorted(t3, 12.0)
+            phi_12 = np.degrees(X3[min(idx_12, len(X3)-1), 6])
+            mask_adv = (t3 >= 5.0) & (t3 < 7.0)
+            r_adv = np.degrees(X3[mask_adv, 5].mean()) if mask_adv.any() else 0.0
 
             self._console_write(c, "\n─── Valores pico ──────────────────────", "heading")
             self._console_write(c,
-                f"  p_mín = {p_min:.3f}°/s  a t = {t_pmin:.0f} s", "val")
+                f"  p_mín = {p_min:.3f}°/s  a t = {t_pmin:.1f} s", "val")
             self._console_write(c,
-                f"  φ @ t=35 s = {phi_35:.3f}° (negativo = izquierda)", "val")
+                f"  φ @ t=12 s = {phi_12:.3f}° (negativo = izquierda)", "val")
             self._console_write(c,
-                f"  r promedio (t=30–32 s) = {r_adv:.4f}°/s (guiñada adversa)", "val")
+                f"  r promedio (t=5–7 s) = {r_adv:.4f}°/s (guiñada adversa)", "val")
 
             self._console_write(c, "\n─── Secuencia de eventos ──────────────", "heading")
             steps = [
-                "1. t=30 s: δa=+5° → Cl<0 → p negativo → φ negativo (banqueo izq.)",
-                "2. t=30–32 s: guiñada adversa leve (acoplamiento alabeo-guiñada)",
+                "1. t=5 s: δa=+5° → Cl<0 → p negativo → φ negativo (banqueo izq.)",
+                "2. t=5–7 s: guiñada adversa leve (acoplamiento alabeo-guiñada)",
                 "3. v crece: deslizamiento lateral por el banqueo",
-                "4. t=32 s: δa=0 → p se amortigua; φ permanece negativo",
-                "5. t>32 s: Dutch-roll (p, r, v, φ oscilan) + modo espiral",
+                "4. t=7 s: δa=0 → p se amortigua; φ permanece negativo",
+                "5. t>7 s: Dutch-roll (p, r, v, φ oscilan) + modo espiral",
             ]
             for s in steps:
                 self._console_write(c, f"  {s}")
@@ -648,16 +655,16 @@ class RCAMApp(tk.Tk):
         plot_3d_comparison_embedded(
             self._t3_3d_frame,
             [pos3],
-            ["Alerón +5° (t=30–32 s)"],
+            ["Alerón +5° (t=5–7 s)"],
             [ACCENT_ORG],
         )
         plot_states_embedded(
             self._t3_state_frame, t3,
             [X3, X2],
-            ["Alerón +5° (t=30–32 s)", "Base (ref.)"],
+            ["Alerón +5° (t=5–7 s)", "Base (ref.)"],
             [ACCENT_ORG, ACCENT_BLUE],
-            event_times=[30.0, 32.0],
-            event_labels=["t=30 s (ON)", "t=32 s (OFF)"]
+            event_times=[5.0, 7.0],
+            event_labels=["t=5 s (ON)", "t=7 s (OFF)"]
         )
         # Detalle lateral: p, φ, r, v
         for w in self._t3_lat_frame.winfo_children():
@@ -676,8 +683,8 @@ class RCAMApp(tk.Tk):
             ax.plot(t3, X3[:, idx], color=ACCENT_ORG, lw=2,   label="δa=+5°")
             ax.plot(t3, X2[:, idx], color=ACCENT_BLUE, lw=1.4,
                     linestyle='--', label="Base")
-            ax.axvline(30, color=ACCENT_RED,   ls=':', lw=1.4, label='t=30 s')
-            ax.axvline(32, color=ACCENT_ORG,   ls=':', lw=1.4, label='t=32 s')
+            ax.axvline(5,  color=ACCENT_RED,   ls=':', lw=1.4, label='t=5 s')
+            ax.axvline(7,  color=ACCENT_ORG,   ls=':', lw=1.4, label='t=7 s')
             ax.axhline(0,  color=TEXT_DIM,     lw=0.7)
             ax.set_xlabel('Tiempo [s]', fontsize=7)
             ax.set_ylabel(ylab, fontsize=7)
@@ -744,22 +751,24 @@ class RCAMApp(tk.Tk):
             self._console_write(c, "  TAREA 4a — FALLA MOTOR 1 (t≥30 s)", "heading")
             self._console_write(c, "═"*55, "heading")
 
-            if "t2" not in self._data:
-                t2, X2, pos2 = simulate(X0, constant_control, (0, 180), dt=1.0)
-                self._data["t2"] = {"t": t2, "X": X2, "pos": pos2}
-            X2   = self._data["t2"]["X"]
-            t2   = self._data["t2"]["t"]
-            pos2 = self._data["t2"]["pos"]
+            # dt=0.1 s para AMBAS simulaciones → mismo número de puntos → sin error de shape.
+            if "t2_fine" not in self._data:
+                self._console_write(c, "  Calculando base (alta resolución)…", "dim")
+                t2, X2, pos2 = simulate(X0, constant_control, (0, 180), dt=0.1)
+                self._data["t2_fine"] = {"t": t2, "X": X2, "pos": pos2}
+            X2   = self._data["t2_fine"]["X"]
+            t2   = self._data["t2_fine"]["t"]
+            pos2 = self._data["t2_fine"]["pos"]
 
             self._console_write(c, "  Simulando con falla de motor 1…", "dim")
-            t4, X4, pos4 = simulate(X0, engine_shutdown_control, (0, 180), dt=1.0)
+            t4, X4, pos4 = simulate(X0, engine_shutdown_control, (0, 180), dt=0.1)
             self._data["t4a"] = {"t": t4, "X": X4, "pos": pos4}
 
             self.after(0, lambda: self._render_task4a(t4, X4, X2, pos4, pos2))
 
             self._console_write(c, "\n✔  Simulación completada.", "ok")
 
-            idx_60 = min(60, len(X4)-1)
+            idx_60 = min(np.searchsorted(t4, 60.0), len(X4) - 1)
             r60  = np.degrees(X4[idx_60, 5])
             ph60 = np.degrees(X4[idx_60, 6])
             v60  = X4[idx_60, 1]
@@ -987,9 +996,9 @@ class RCAMApp(tk.Tk):
             self._console_write(c,
                 f"    δr   = {np.degrees(U_trim[2]):.4f} °", "val")
             self._console_write(c,
-                f"    δTH1 = {np.degrees(U_trim[3]):.4f} °", "val")
+                f"    δTH1 = {U_trim[3]:.4f}  (fracción, F = dth·m·g)", "val")
             self._console_write(c,
-                f"    δTH2 = {np.degrees(U_trim[4]):.4f} °", "val")
+                f"    δTH2 = {U_trim[4]:.4f}  (fracción, F = dth·m·g)", "val")
             self._console_write(c, "\n  Residuo Ẋ @ trim (→ 0):", "heading")
             self._console_write(c,
                 f"    [u̇,v̇,ẇ] = {np.round(Xd_trim[0:3],6)}", "val")
