@@ -2,36 +2,6 @@
 =============================================================================
 RCAM Aircraft Model — Mathematical Core  (VERSIÓN CORREGIDA v3)
 Final Task - Aircraft Dynamics Simulation
-
-CORRECCIONES APLICADAS (vs versión v2):
-  1. Integración: Forward Euler → Runge-Kutta 4 (RK4)
-
-  2. Stall negativo: stall simétrico a ±14.5°.
-
-  3. Singularidad de Euler: clamp de theta en ±89°.
-
-  4. [NUEVA — v3] Escalas de longitud de referencia de momentos:
-     El modelo RCAM define tres coeficientes de momento:
-       Cl (alabeo)  → se dimensionaliza con Q*S*b     (envergadura b=44.8 m)
-       Cm (cabeceo) → se dimensionaliza con Q*S*cbar  (cuerda media cbar=6.6 m)
-       Cn (guiñada) → se dimensionaliza con Q*S*b
-
-     La versión v2 aplicaba Q*S*cbar a los tres, subestimando Cl y Cn
-     por un factor b/cbar ≈ 6.8. Esto hacía que los momentos de alabeo y
-     guiñada fueran ~7x demasiado pequeños, dejando al avión sin suficiente
-     restauración lateral → deriva continua de phi, psi, p, r en el trim.
-
-     Corrección: cada fila de M_Aac_b se multiplica por su longitud correcta:
-       M_Aac_b = C_Mac_b * Q_dyn * S * [b, cbar, b]
-
-     La misma corrección aplica a las derivadas de amortiguamiento dCm_dx:
-     las filas de alabeo y guiñada usan (b/Va) en lugar de (cbar/Va).
-
-  5. [NUEVA — v3] Límite inferior de alpha en PSO: de −5° a 0°.
-     Va=78 m/s a nivel del mar con la aeronave RCAM requiere alpha ≈ 3–5°.
-     El límite anterior de −5° cubría ese rango pero sesgaba las partículas
-     hacia valores negativos físicamente incorrectos. Con 0° como límite
-     inferior el PSO converge más rápido y al valor físicamente esperado.
 =============================================================================
 """
 
@@ -85,7 +55,6 @@ dep_da = 0.25
 # LÍMITES DE CONTROL
 # Los tres primeros valores son ángulos de superficie [rad].
 # Los dos últimos son posiciones de throttle adimensionales (0–1).
-# NOTA: NO se aplica pi/180 a los throttles — son fracciones directas.
 # =============================================================================
 U_MIN = np.array([-25.0 * np.pi/180.0,
                   -25.0 * np.pi/180.0,
@@ -138,9 +107,6 @@ def _cl_wb(alpha):
         return a3*alpha**3 + a2*alpha**2 + a1*alpha + a0
 
     # --- Stall NEGATIVO (alpha muy negativo, nariz abajo) ---
-    # Umbral negativo: reflexión del umbral positivo alrededor de alpha_L0
-    #   alpha_stall_neg = 2*alpha_L0 - alpha_stall ≈ -0.654 rad ≈ -37.5°
-    # Ese valor es muy extremo para vuelo civil normal, pero se protege igualmente.
     alpha_stall_neg = 2.0 * alpha_L0 - alpha_stall   # ≈ -37.5 deg
 
     if alpha <= alpha_stall_neg:
@@ -170,13 +136,6 @@ def xdot(X, U):
     Retorna
     -------
     Xdot : ndarray (9,)
-
-    CORRECCIÓN 3 — Singularidad de Euler:
-      La matriz cinemática H tiene términos tan(theta) y 1/cos(theta).
-      Sin protección, theta = ±90° genera NaN y la simulación explota.
-      Se aplica clamp de theta a ±89° antes de construir H.
-      Esto es aceptable para una aeronave civil (nunca debería superar ±30°
-      en vuelo normal); en vuelo acrobático se requeriría cuaterniones.
     """
 
     # --- Desempaquetar estado ---
@@ -206,16 +165,15 @@ def xdot(X, U):
 
     # =========================================================================
     # PASO 3: Coeficientes aerodinámicos
-    # CORRECCIÓN 2 aplicada aquí: CL_wb usa modelo con stall bilateral
     # =========================================================================
     CL_wb = _cl_wb(alpha)
 
     epsilon = dep_da * (alpha - alpha_L0)
     alpha_t = alpha - epsilon + de + 1.3 * q_rate * (lt / Va)
-    CL_t    = 3.1 * (St / S) * alpha_t
+    CL_t    = 3.1 * (St / S) * alpha_t  # aqui utilizamos cl para stall bilateral
 
     CL = CL_wb + CL_t
-    CD = 0.13 + 0.07 * (CL_wb - 0.45)**2   # GARTEUR ec. 2.31 — usa CL_wb real
+    CD = 0.13 + 0.07 * (CL_wb - 0.45)**2  
     CY = -1.6 * beta + 0.24 * dr
 
     # =========================================================================
@@ -293,7 +251,6 @@ def xdot(X, U):
 
     # =========================================================================
     # PASO 10: Ecuaciones de movimiento
-    # CORRECCIÓN 3 — Singularidad de Euler:
     #   theta se clampea a ±89° para proteger tan(theta) y 1/cos(theta).
     #   Si theta llega a 89° en simulación, la aeronave ya está en una
     #   actitud irrecuperable; el clamp solo evita que el integrador explote.
@@ -344,32 +301,7 @@ def body_to_earth_vel(X, Vb):
 def simulate(X0, U_func, t_span, dt=1.0, dt_internal=0.05):
     """
     Simula la dinámica RCAM usando Runge-Kutta de orden 4 (RK4).
-
-    CORRECCIÓN 1 — Integrador Forward Euler → RK4:
-
-      Forward Euler:  X_{n+1} = X_n + h * f(X_n, U_n)
-        Error local:  O(h²)   Error global: O(h)
-        Problema: acumula error linealmente con el tiempo. Para h=0.05 s y
-        una simulación de 180 s → 3600 pasos → error global no despreciable.
-        Además, Forward Euler es condicionalmente estable; el modo de periodo
-        corto del RCAM (frecuencia ~1 rad/s, amortiguamiento ~0.3) puede
-        volverse inestable numéricamente con pasos grandes.
-
-      RK4:  usa 4 evaluaciones de f por paso (k1..k4):
-        k1 = f(X_n,          U_n)
-        k2 = f(X_n + h/2*k1, U_n)
-        k3 = f(X_n + h/2*k2, U_n)
-        k4 = f(X_n +   h*k3, U_n)
-        X_{n+1} = X_n + (h/6)*(k1 + 2*k2 + 2*k3 + k4)
-        Error local: O(h^5)  Error global: O(h^4)
-
-      Con h=0.05 s, RK4 reduce el error en un factor ~(0.05)^3 ≈ 125
-      respecto a Forward Euler para el mismo paso. Permite usar pasos más
-      grandes manteniendo precisión equivalente.
-
-      Coste extra: 4x evaluaciones de xdot por paso (de ~7200 a ~28800
-      llamadas para 180 s), lo cual es aceptable en Python para esta escala.
-
+    
     Parámetros
     ----------
     X0          : ndarray (9,)  — estado inicial
@@ -458,13 +390,6 @@ def engine_shutdown_control(t, X):
 
     El throttle es una fracción adimensional: F_i = dth_i * m * g (GARTEUR ec. 2.34).
     El throttle nominal es u0[3] = u0[4] = 0.08 (empuje total ≈ 0.16 * m*g).
-
-    FALLA COMPLETA: dth1 → 0 (cero empuje en motor 1).
-      - Reduce el empuje total a la mitad (sólo motor 2 activo).
-      - Genera momento de guiñada asimétrico:
-          Mz = Z_apt1 * F1 - Z_apt2 * F2  (con F1=0, F2 = 0.08*m*g)
-        → la aeronave guiña HACIA el motor fallado (izquierda, phi > 0).
-      - Sin corrección de timón, el avión entra en una espiral progresiva.
 
     NOTA: GARTEUR sec. 2.5 menciona que en falla el throttle 'se reduce a 0.5'
     pero eso es dentro de su modelo de actuador normalizado [0.5, 1.0] donde
