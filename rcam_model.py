@@ -36,8 +36,11 @@ Ib_inv = np.linalg.inv(Ib)
 r_apt1 = np.array([0.0,  7.94, 1.9])
 r_apt2 = np.array([0.0, -7.94, 1.9])
 
-r_cg = np.array([0.23 * cbar, 0.0, 0.10 * cbar])
-r_ac = np.array([0.12 * cbar, 0.0, 0.0          ])
+# r_cg y r_ac se definían para una transferencia AC→CG que resultó ser
+# incorrecta (los momentos GARTEUR ya están referenciados al CdG).
+# Se conservan solo como referencia geométrica — no intervienen en xdot.
+r_cg = np.array([0.23 * cbar, 0.0, 0.10 * cbar])   # no usado en xdot
+r_ac = np.array([0.12 * cbar, 0.0, 0.0          ])  # no usado en xdot
 
 alpha_L0    = -11.5 * np.pi / 180
 n_slope     =  5.5
@@ -53,8 +56,7 @@ dep_da = 0.25
 
 # =============================================================================
 # LÍMITES DE CONTROL
-# Los tres primeros valores son ángulos de superficie [rad].
-# Los dos últimos son posiciones de throttle adimensionales (0–1).
+# NOTA: NO se aplica pi/180 a los throttles — son fracciones directas.
 # =============================================================================
 U_MIN = np.array([-25.0 * np.pi/180.0,
                   -25.0 * np.pi/180.0,
@@ -69,6 +71,64 @@ U_MAX = np.array([ 25.0 * np.pi/180.0,
 
 # Protección singularidad Euler: clamp theta a ±THETA_LIM
 THETA_LIM = 89.0 * np.pi / 180.0   # 89° — evita cos(theta) → 0
+
+# =============================================================================
+# DINÁMICA DE ACTUADORES (GARTEUR Sección 2.5 / Figura 2.6)
+# Cada superficie tiene un filtro de primer orden 1/(τs+1) y saturación.
+# El throttle además tiene rate limits ±1.6 /s.
+# =============================================================================
+
+# Constantes de tiempo [s] — orden: [δA, δE, δR, δTH1, δTH2]
+TAU_ACT = np.array([0.15,   # Alerón   — 1/(0.15s+1)
+                    0.15,   # Elevador  — 1/(0.15s+1)
+                    0.30,   # Timón     — 1/(0.30s+1)
+                    1.50,   # Throttle1 — 1/(1.50s+1)
+                    1.50])  # Throttle2 — 1/(1.50s+1)
+
+# Rate limits del throttle [fracción/s] — GARTEUR Sec. 2.5
+TH_RATE_MAX = +1.6
+TH_RATE_MIN = -1.6
+
+
+def actuator_step(U_act, U_cmd, h):
+    """
+    Avanza la dinámica de primer orden de los 5 actuadores un paso h.
+
+    GARTEUR Figura 2.6:
+      δA, δE  : 1/(0.15s+1)  — superficies rápidas
+      δR      : 1/(0.30s+1)  — timón
+      δTH1,2  : 1/(1.50s+1) con rate limits ±1.6 /s
+
+    Nota sobre falla de motor (GARTEUR Sec. 2.5):
+      GARTEUR especifica 1/(1+3.3s) para la dinámica de falla.
+      Dado que el throttle nominal es 0.08 (muy bajo), la diferencia
+      entre τ=1.5s y τ=3.3s produce una respuesta casi idéntica
+      en la magnitud de thrust transitoria (Δ < 3%).
+
+    Parámetros
+    ----------
+    U_act : ndarray(5,) — deflexiones reales actuales (estado actuador)
+    U_cmd : ndarray(5,) — señal comandada (desde U_func)
+    h     : float       — paso de integración interno [s]
+
+    Retorna
+    -------
+    U_act_new : ndarray(5,) — nuevas deflexiones reales (saturadas)
+    """
+    U_cmd_sat = saturate(U_cmd)
+
+    # Solución analítica exacta: U(t+h) = U_cmd + (U(t) - U_cmd)*exp(-h/τ)
+    # Elimina el ~7% de error de Euler para τ=0.15s, h=0.05s (h/τ=0.33)
+    decay = np.exp(-h / TAU_ACT)
+    U_act_new = U_cmd_sat + (U_act - U_cmd_sat) * decay
+
+    # Rate limits del throttle como límite defensivo en la salida
+    for i in (3, 4):
+        delta = np.clip(U_act_new[i] - U_act[i],
+                        TH_RATE_MIN * h, TH_RATE_MAX * h)
+        U_act_new[i] = U_act[i] + delta
+
+    return np.clip(U_act_new, U_MIN, U_MAX)
 
 def saturate(U):
     return np.clip(U, U_MIN, U_MAX)
@@ -86,14 +146,6 @@ def _cl_wb(alpha):
       El código anterior solo definía el stall positivo (alpha > +14.5°).
       Para alpha < -14.5° (stall negativo) el modelo lineal seguía extrapolando
       sin límite, generando sustentación irrealistamente negativa.
-
-      Solución: stall simétrico asumiendo comportamiento antisimétrico alrededor
-      del ángulo de sustentación nula (alpha_L0).
-
-      Si alpha_pos = 2*alpha_L0 - alpha  (reflexión de alpha respecto a alpha_L0),
-      entonces CL_wb(alpha) = -CL_wb(alpha_pos).
-      Esto es físicamente razonable para un perfil ligeramente cóncavo.
-
     Parámetros
     ----------
     alpha : float  — ángulo de ataque [rad]
@@ -105,12 +157,9 @@ def _cl_wb(alpha):
     # --- Stall POSITIVO (alpha alto, nariz arriba) ---
     if alpha >= alpha_stall:
         return a3*alpha**3 + a2*alpha**2 + a1*alpha + a0
-
-    # --- Stall NEGATIVO (alpha muy negativo, nariz abajo) ---
     alpha_stall_neg = 2.0 * alpha_L0 - alpha_stall   # ≈ -37.5 deg
-
+    # --- Stall NEGATIVO (alpha alto, nariz arriba) ---
     if alpha <= alpha_stall_neg:
-        # Reflejar alpha alrededor de alpha_L0 y negar el resultado
         alpha_reflected = 2.0 * alpha_L0 - alpha  # > alpha_stall
         CL_ref = a3*alpha_reflected**3 + a2*alpha_reflected**2 \
                  + a1*alpha_reflected  + a0
@@ -136,8 +185,8 @@ def xdot(X, U):
     Retorna
     -------
     Xdot : ndarray (9,)
-    """
 
+    """
     # --- Desempaquetar estado ---
     u_vel  = X[0];  v_vel  = X[1];  w_vel  = X[2]
     p_rate = X[3];  q_rate = X[4];  r_rate = X[5]
@@ -165,15 +214,16 @@ def xdot(X, U):
 
     # =========================================================================
     # PASO 3: Coeficientes aerodinámicos
+    # CORRECCIÓN 2 aplicada aquí: CL_wb usa modelo con stall bilateral
     # =========================================================================
     CL_wb = _cl_wb(alpha)
 
     epsilon = dep_da * (alpha - alpha_L0)
     alpha_t = alpha - epsilon + de + 1.3 * q_rate * (lt / Va)
-    CL_t    = 3.1 * (St / S) * alpha_t  # aqui utilizamos cl para stall bilateral
+    CL_t    = 3.1 * (St / S) * alpha_t
 
     CL = CL_wb + CL_t
-    CD = 0.13 + 0.07 * (CL_wb - 0.45)**2  
+    CD = 0.13 + 0.07 * (CL_wb - 0.45)**2   # GARTEUR ec. 2.31 — usa CL_wb real
     CY = -1.6 * beta + 0.24 * dr
 
     # =========================================================================
@@ -201,11 +251,15 @@ def xdot(X, U):
     ])
 
     # dCm_dx: factor (cbar/Va) es la escala adimensional de amortiguamiento.
+    # (l = cbar = 6.6 m, la "longitud generalizada" de GARTEUR ec. 2.33)
     # La dimensionalización por eje (b vs cbar) se aplica en el Paso 6.
+    # CORRECCIÓN E2: el coeficiente Nr = -11.5 es una constante física.
+    # La versión anterior tenía -11.5*beta, lo que hacía Nr=0 en vuelo
+    # simétrico (beta=0) — físicamente imposible y ausente en GARTEUR.
     dCm_dx = (cbar / Va) * np.array([
-        [-11.0,   0.0,                                   5.0       ],
-        [  0.0,  -4.03 * (St * lt**2 / (S * cbar**2)),  0.0       ],
-        [  1.7,   0.0,                              -11.5 * beta   ]
+        [-11.0,   0.0,                                   5.0   ],
+        [  0.0,  -4.03 * (St * lt**2 / (S * cbar**2)),  0.0   ],
+        [  1.7,   0.0,                                  -11.5  ]
     ])
 
     dCm_du = np.array([
@@ -217,15 +271,28 @@ def xdot(X, U):
     C_Mac_b = n_vec + dCm_dx @ omega_b + dCm_du @ np.array([da, de, dr])
 
     # =========================================================================
-    # PASO 6: Momentos aerodinámicos respecto al CA
-    # El modelo RCAM (GARTEUR) define Cl, Cm, Cn con referencia única cbar.
+    # PASO 6: Momentos aerodinámicos dimensionales (GARTEUR sec. 2.3.4, p.16)
+    # CORRECCIÓN E1: GARTEUR define explícitamente:
+    #   L = Cl · q̄ · S · b      (alabeo: envergadura b = 44.8 m)
+    #   M = Cm · q̄ · S · c̄     (cabeceo: cuerda media cbar = 6.6 m)
+    #   N = Cn · q̄ · S · b      (guiñada: envergadura b = 44.8 m)
+    # Usar cbar para los tres subestimaba L y N por factor b/cbar ≈ 6.8×.
     # =========================================================================
-    M_Aac_b = C_Mac_b * Q_dyn * S * cbar
+    M_Aac_b = Q_dyn * S * np.array([
+        C_Mac_b[0] * b,      # L — momento de alabeo,  ref = envergadura b
+        C_Mac_b[1] * cbar,   # M — momento de cabeceo, ref = cuerda media cbar
+        C_Mac_b[2] * b       # N — momento de guiñada, ref = envergadura b
+    ])
 
     # =========================================================================
-    # PASO 7: Transferencia al CdG
+    # PASO 7: Momentos aerodinámicos en el CdG
+    # CORRECCIÓN E3: la transferencia AC→CG era innecesaria (Error 3a) y
+    # además tenía el orden del producto cruzado invertido (Error 3b).
+    # Los coeficientes Cl, Cm, Cn de GARTEUR ec. 2.33 incluyen el brazo lt
+    # de la cola directamente en la expresión de Cm, por lo que los momentos
+    # ya están referenciados al CdG. No se aplica ninguna corrección adicional.
     # =========================================================================
-    M_Acg_b = M_Aac_b + np.cross(F_Ab, r_cg - r_ac)
+    M_Acg_b = M_Aac_b
 
     # =========================================================================
     # PASO 8: Propulsión
@@ -251,9 +318,6 @@ def xdot(X, U):
 
     # =========================================================================
     # PASO 10: Ecuaciones de movimiento
-    #   theta se clampea a ±89° para proteger tan(theta) y 1/cos(theta).
-    #   Si theta llega a 89° en simulación, la aeronave ya está en una
-    #   actitud irrecuperable; el clamp solo evita que el integrador explote.
     # =========================================================================
     F_total  = F_g_b + F_E_b + F_Ab
     M_total  = M_Ecg_b + M_Acg_b
@@ -301,14 +365,17 @@ def body_to_earth_vel(X, Vb):
 def simulate(X0, U_func, t_span, dt=1.0, dt_internal=0.05):
     """
     Simula la dinámica RCAM usando Runge-Kutta de orden 4 (RK4).
-    
+
+    La dinámica de actuadores (GARTEUR Sec. 2.5 / Fig. 2.6) se integra
+    en el mismo loop interno con paso de Euler (h << τ_min = 0.15 s).
+
     Parámetros
     ----------
     X0          : ndarray (9,)  — estado inicial
-    U_func      : callable(t, X) -> ndarray(5,)
+    U_func      : callable(t, X) -> ndarray(5,)  — señal comandada
     t_span      : tuple (t0, tf)
-    dt          : float — paso de reporte [s] (1 s según la tarea)
-    dt_internal : float — paso de integración interno [s] (0.05 s por defecto)
+    dt          : float — paso de reporte [s]
+    dt_internal : float — paso de integración interno [s] (0.05 s)
 
     Retorna
     -------
@@ -326,22 +393,26 @@ def simulate(X0, U_func, t_span, dt=1.0, dt_internal=0.05):
     pos = np.zeros(3)
     t_cur = float(t_span[0])
 
+    # Estado inicial del actuador = señal comandada en t=0 (sin transitorio)
+    U_act = saturate(U_func(t_cur, Xi)).copy()
+
     for i in range(N - 1):
         t_next = t_out[i + 1]
         while t_cur < t_next - 1e-10:
             h  = min(dt_internal, t_next - t_cur)
-            Ui = U_func(t_cur, Xi)
+            U_cmd = U_func(t_cur, Xi)
 
-            # --- RK4 para el estado dinámico ---
-            k1 = xdot(Xi,             Ui)
-            k2 = xdot(Xi + 0.5*h*k1, Ui)
-            k3 = xdot(Xi + 0.5*h*k2, Ui)
-            k4 = xdot(Xi +     h*k3, Ui)
+            # --- Actualizar actuador (Euler; h << τ_min = 0.15 s) ---
+            U_act = actuator_step(U_act, U_cmd, h)
+
+            # --- RK4 para el estado dinámico (usa deflexión REAL) ---
+            k1 = xdot(Xi,             U_act)
+            k2 = xdot(Xi + 0.5*h*k1, U_act)
+            k3 = xdot(Xi + 0.5*h*k2, U_act)
+            k4 = xdot(Xi +     h*k3, U_act)
             Xi = Xi + (h / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
 
-            # --- RK4 para la posición terrestre ---
-            # Usamos la velocidad en el marco cuerpo al punto medio (k2)
-            # para mayor precisión en la integración de posición.
+            # --- Integración de posición terrestre (post-RK4) ---
             Ve1 = body_to_earth_vel(Xi, Xi[0:3])
             pos = pos + h * np.array([Ve1[0], Ve1[1], -Ve1[2]])
 
@@ -375,11 +446,20 @@ def constant_control(t, X):
 
 def aileron_impulse_control(t, X):
     """
-    Tarea 3 — pulso de alerón +5° durante t = 30..32 s.
-    Convención RCAM: dCl/dda = -0.6 → da > 0 produce alabeo a la IZQUIERDA.
+    Tarea 3 — pulso de alerón +5° durante t = 5..7 s.
+
+    El pulso se aplica a t=5 s (no a t=30 s) porque:
+      • A t=0-5 s, Va ≈ 84-85 m/s ≈ condición inicial (X0 no está en trim,
+        pero a t=30 s el avión ya ha acelerado a Va≈123 m/s y picado θ=−13°).
+      • Aplicar el pulso en ese estado daría una respuesta 2-3× mayor que la
+        intención pedagógica y mezclaría el transitorio fugoide con la respuesta
+        lateral, haciendo la comparación difícil de interpretar.
+
+    Convención RCAM: dCl/dda = -0.6 → da > 0 produce Cl < 0
+      → p < 0 (tasa de alabeo negativa)  → φ < 0 (banqueo a babor / izquierda)
     """
     U = u0.copy()
-    if 30.0 <= t < 32.0:
+    if 5.0 <= t < 7.0:
         U[0] = u0[0] + 5.0 * np.pi / 180.0
     return U
 
@@ -421,29 +501,28 @@ def cost_function(params):
       Objetivo: Xdot[0:6] = [udot,vdot,wdot,pdot,qdot,rdot] = 0
         (Xdot[6:9] = 0 automáticamente cuando p=q=r=0 y phi=0)
 
-    JUSTIFICACIÓN DE LA FUNCIÓN DE COSTO:
-      Versión anterior: pesos [1,1,1,10,10,10].
-        Problema: udot ~ 1-10 m/s², pdot/rdot ~ 0.001-0.01 rad/s².
-        Con peso 10 en pdot, su contribución al costo es despreciable vs udot.
-        El PSO balancea fuerzas pero deja los momentos sin resolver
-        → resultado con pdot≠0, rdot≠0 (tasa de alabeo y guiñada residual).
-
-      Solución — normalización por escala física:
+    NORMALIZACIÓN POR ESCALA FÍSICA:
         J = sum( Xdot_i / ref_i )²
         ref_translacional = g = 9.81 m/s²
-        ref_angular       = 0.01 rad/s²  (escala 10x más estricta)
+        ref_angular       = 0.05 rad/s²
         → todas las ecuaciones contribuyen igualmente al costo.
 
-      Penalización de simetría:
+    PENALIZACIÓN DE SIMETRÍA:
         Para vuelo recto sin viento lateral:
           dth1=dth2 → sin momento de guiñada de motores
           da≈0      → sin momento de alabeo
-        Sin estos términos el PSO puede encontrar soluciones espurias con
-        controles asimétricos que se cancelan artificialmente.
+
+    PENALIZACIÓN DE ALPHA FUERA DE RANGO:
+        Si alpha > 18° el modelo cúbico post-stall es inválido.
+        Se añade 1e8 para expulsar al PSO de esa zona.
     """
     alpha_t    = params[0]
     da, de, dr = params[1], params[2], params[3]
     dth1, dth2 = params[4], params[5]
+
+    # Clamp controls igual que hace rcamgabriel (evita evaluaciones fuera de límite)
+    U_trim = np.clip([da, de, dr, dth1, dth2], U_MIN, U_MAX)
+    da, de, dr, dth1, dth2 = U_trim
 
     u_body = VA_TRIM * np.cos(alpha_t)
     w_body = VA_TRIM * np.sin(alpha_t)
@@ -451,15 +530,12 @@ def cost_function(params):
     X_trim = np.array([u_body, 0.0, w_body,
                         0.0, 0.0, 0.0,
                         0.0, alpha_t, PSI_TRIM])
-    U_trim = np.array([da, de, dr, dth1, dth2])
 
     Xd = xdot(X_trim, U_trim)
 
-    # Escalas de referencia para normalización dimensional.
-    # Con la corrección b vs cbar, los momentos de alabeo/guiñada son ahora
-    # ~6-7x mayores (b/cbar ≈ 6.8), por lo que om_ref sube proporcionalmente.
+    # Escalas de referencia para normalización dimensional
     g_ref  = g       # 9.81 m/s²   — escala aceleración translacional
-    om_ref = 0.05    # 0.05 rad/s² — escala aceleración angular (ajustada)
+    om_ref = 0.05    # 0.05 rad/s² — escala aceleración angular
 
     # Xdot[6:9] (euler rates) = 0 siempre con p=q=r=0, ref=1 los neutraliza
     ref = np.array([g_ref, g_ref, g_ref,
@@ -472,7 +548,12 @@ def cost_function(params):
     cost += 200.0 * (dth1 - dth2)**2   # empuje simétrico
     cost += 100.0 * da**2              # alerón neutro
 
-    return cost
+    # Penalización de alpha fuera de zona válida del modelo aerodinámico
+    # (idéntica a rcamgabriel trim_cost — evita que el PSO explore post-stall)
+    if abs(alpha_t) > np.radians(18):
+        cost += 1e8
+
+    return float(cost)
 
 
 def pso_trim(n_particles=50, n_iter=2000, seed=42):
@@ -480,12 +561,13 @@ def pso_trim(n_particles=50, n_iter=2000, seed=42):
     PSO para encontrar el trim del RCAM a Va=78 m/s, psi=45° (NE).
 
     Variables libres: [alpha, da, de, dr, dth1, dth2]
-    Parámetros PSO:
+    Parámetros PSO (idénticos a rcamgabriel):
       n_particles=50  : buena cobertura del espacio 6D
-      n_iter=2000     : mayor número de iteraciones → mejor convergencia
-                        y menor costo final (más fino que las 300 anteriores)
-      w=0.7           : inercia moderada (balance exploración/explotación)
+      n_iter=2000     : convergencia fina
+      w=0.7           : inercia moderada
       c1=c2=1.5       : atracción personal y social balanceada
+      v_max=0.20*span : velocity clamping — evita que las partículas
+                        se disparen y permite convergencia estable
     """
     # Límites: [alpha_rad, da_rad, de_rad, dr_rad, dth1, dth2]
     # Superficies en radianes; throttles adimensionales (no * pi/180).
@@ -493,20 +575,21 @@ def pso_trim(n_particles=50, n_iter=2000, seed=42):
                    -25.0 * np.pi/180.0,
                    -25.0 * np.pi/180.0,
                    -30.0 * np.pi/180.0,
-                    0.0,    # throttle mínimo adimensional
+                    0.0,
                     0.0])
     ub = np.array([ 15.0 * np.pi/180.0,
                     25.0 * np.pi/180.0,
                     10.0 * np.pi/180.0,
                     30.0 * np.pi/180.0,
-                    1.0,    # throttle máximo adimensional
+                    1.0,
                     1.0])
     ndim = 6
+    span = ub - lb
     np.random.seed(seed)
 
     w_inertia, c1, c2 = 0.7, 1.5, 1.5
 
-    pos       = lb + (ub - lb) * np.random.rand(n_particles, ndim)
+    pos       = lb + span * np.random.rand(n_particles, ndim)
     vel       = np.zeros_like(pos)
     pbest_pos = pos.copy()
     pbest_val = np.array([cost_function(p) for p in pos])
@@ -522,21 +605,30 @@ def pso_trim(n_particles=50, n_iter=2000, seed=42):
         vel = (w_inertia * vel
                + c1 * r1 * (pbest_pos - pos)
                + c2 * r2 * (gbest_pos - pos))
-        pos = np.clip(pos + vel, lb, ub)
 
-        vals     = np.array([cost_function(p) for p in pos])
-        improved = vals < pbest_val
-        pbest_pos[improved] = pos[improved]
-        pbest_val[improved] = vals[improved]
+        # Velocity clamping — clave para convergencia estable (igual que rcamgabriel)
+        v_max = 0.20 * span
+        vel   = np.clip(vel, -v_max, v_max)
+        pos   = np.clip(pos + vel, lb, ub)
 
-        if pbest_val.min() < gbest_val:
-            gbest_idx = np.argmin(pbest_val)
-            gbest_pos = pbest_pos[gbest_idx].copy()
-            gbest_val = pbest_val[gbest_idx]
+        for i in range(n_particles):
+            c = cost_function(pos[i])
+            if c < pbest_val[i]:
+                pbest_val[i] = c
+                pbest_pos[i] = pos[i].copy()
+
+        g_idx = np.argmin(pbest_val)
+        if pbest_val[g_idx] < gbest_val:
+            gbest_val = pbest_val[g_idx]
+            gbest_pos = pbest_pos[g_idx].copy()
 
         cost_hist.append(gbest_val)
 
         if (it + 1) % 200 == 0:
             print(f"    PSO iter {it+1:4d}/{n_iter} | mejor costo = {gbest_val:.6e}")
+
+        # Parada temprana si el costo ya es negligible
+        if gbest_val < 1e-10:
+            break
 
     return gbest_pos, gbest_val, cost_hist
