@@ -520,7 +520,6 @@ def cost_function(params):
     da, de, dr = params[1], params[2], params[3]
     dth1, dth2 = params[4], params[5]
 
-    # Clamp controls igual que hace rcamgabriel (evita evaluaciones fuera de límite)
     U_trim = np.clip([da, de, dr, dth1, dth2], U_MIN, U_MAX)
     da, de, dr, dth1, dth2 = U_trim
 
@@ -549,7 +548,6 @@ def cost_function(params):
     cost += 100.0 * da**2              # alerón neutro
 
     # Penalización de alpha fuera de zona válida del modelo aerodinámico
-    # (idéntica a rcamgabriel trim_cost — evita que el PSO explore post-stall)
     if abs(alpha_t) > np.radians(18):
         cost += 1e8
 
@@ -561,7 +559,6 @@ def pso_trim(n_particles=50, n_iter=2000, seed=42):
     PSO para encontrar el trim del RCAM a Va=78 m/s, psi=45° (NE).
 
     Variables libres: [alpha, da, de, dr, dth1, dth2]
-    Parámetros PSO (idénticos a rcamgabriel):
       n_particles=50  : buena cobertura del espacio 6D
       n_iter=2000     : convergencia fina
       w=0.7           : inercia moderada
@@ -606,7 +603,6 @@ def pso_trim(n_particles=50, n_iter=2000, seed=42):
                + c1 * r1 * (pbest_pos - pos)
                + c2 * r2 * (gbest_pos - pos))
 
-        # Velocity clamping — clave para convergencia estable (igual que rcamgabriel)
         v_max = 0.20 * span
         vel   = np.clip(vel, -v_max, v_max)
         pos   = np.clip(pos + vel, lb, ub)
